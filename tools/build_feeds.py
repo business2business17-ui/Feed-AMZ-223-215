@@ -31,6 +31,42 @@ PKG_ADD = 3                                                 # package is 3 mm bi
 ITEM_WEIGHT_G, PKG_WEIGHT_G = 30, 50
 FEATURES = ["Magnetic", "Wireless Charging Compatible", "Slim Fit", "Lightweight", "Scratch resistant"]
 
+
+FEAT = {"215": ["Built-in ring compatible with MagSafe chargers and accessories", "2.12 mm TPU back", "camera cutout"],
+        "223": ["Built-in magnetic ring compatible with MagSafe chargers and accessories", "2.12 mm TPU back", "camera cutout"]}
+CONN = {"with", "on", "in", "&", "and", "of"}
+
+def split_title(prefix, pn):
+    """Title <= 75: whole print name if it fits, else cut before a connector word / '(' (or at a word
+    boundary); the cut part continues in Item Highlight."""
+    if len(prefix + pn) <= 75: return prefix + pn, ""
+    toks = pn.split(" ")
+    def cl(ws): return " ".join(ws).replace("(", "").replace(")", "")
+    def inside_paren(k):
+        a = " ".join(toks[:k]); return a.count("(") > a.count(")")
+    ok = lambda k: len(prefix + cl(toks[:k])) <= 75 and not inside_paren(k) and toks[k - 1].lower() not in CONN
+    bnd = [i for i, w in enumerate(toks) if i > 0 and (w.lower() in CONN or w.startswith("("))]
+    for k in sorted(bnd, reverse=True):
+        if ok(k): return prefix + cl(toks[:k]), cl(toks[k:])
+    for k in range(len(toks) - 1, 0, -1):
+        if ok(k): return prefix + cl(toks[:k]), cl(toks[k:])
+    raise ValueError(pn)
+
+def title_and_highlight(series, prefix, pn):
+    t, rem = split_title(prefix, pn)
+    h = ""
+    for p in ([rem[0].upper() + rem[1:]] if rem else []) + FEAT[series]:
+        c = p if not h else h + "; " + p
+        if len(c) <= 125 or not h: h = c
+        else: break
+    return t, h
+
+def load_renames():
+    f = os.path.join(ROOT, "renamed_prints_223_215.xlsx")
+    if not os.path.exists(f): return {}
+    wb = openpyxl.load_workbook(f, read_only=True, data_only=True)
+    return {r[1]: r[3] for r in wb["Renamed listings"].iter_rows(min_row=2, values_only=True) if r[1] and r[3]}
+
 def rows(path, sheet):
     wb = openpyxl.load_workbook(os.path.join(ROOT, path), read_only=True, data_only=True)
     return list(wb[sheet].iter_rows(values_only=True))
@@ -53,7 +89,7 @@ def models(model_cell):
         out.append(p)
     return out
 
-def build_series(series, img_file, img_sheet, seo_sheet, template, asin_map):
+def build_series(series, img_file, img_sheet, seo_sheet, template, asin_map, renames):
     img = rows(img_file, img_sheet); seo = rows(img_file, seo_sheet); pr = rows("Amazon_prices_by_series(1).xlsx", series)
     seo = {r[0]: r for r in seo[1:] if r[0]}
     price = {r[0]: r for r in pr[14:] if r[0]}          # header is row 14
@@ -63,8 +99,16 @@ def build_series(series, img_file, img_sheet, seo_sheet, template, asin_map):
         if not sku: continue
         if sku in seen: dups += 1; continue
         seen.add(sku)
-        s = seo[sku]; p = price[sku]
-        if s[10] == "HIGH" and not INCLUDE_HIGH:
+        s = list(seo[sku]); p = price[sku]
+        renamed = None
+        if s[10] == "HIGH" and sku in renames:           # owner supplied a neutral print name
+            new_pn = renames[sku].split(", ", 1)[1]
+            old_pn = s[6].split(" design:")[0]
+            prefix = s[1][:s[1].index(", ") + 2]
+            s[1], s[2] = title_and_highlight(series, prefix, new_pn)
+            s[6] = s[6].replace(old_pn + " design:", new_pn + " design:", 1)
+            renamed = (sku, old_pn, new_pn)
+        elif s[10] == "HIGH" and not INCLUDE_HIGH:
             skipped_high.append((sku, s[1], s[11])); continue
         urls = [u for u in r[3:11 if series == "215" else 11] if u]
         d = {"A": sku, "B": "CELLULAR_PHONE_CASE"}
@@ -115,7 +159,7 @@ def build_series(series, img_file, img_sheet, seo_sheet, template, asin_map):
         d["GJ"], d["GK"] = num(PKG_WEIGHT_G), "Grams"
         d["GO"], d["GP"] = COUNTRY, WARRANTY
         d["GS"], d["GT"] = BATT, BATT
-        recs.append((d, asin, s[10]))
+        recs.append((d, asin, renamed))
     return recs, skipped_high, dups
 
 def load_template_lists(xlsm):
@@ -173,15 +217,16 @@ def main():
     cfg = {"215": ("215 CELLULAR_PHONE_CASE.xlsm", "215_Amazon_29.09_SEO.xlsx", "Sheet", "SEO 215", asin_map),
            "223": ("223 CELLULAR_PHONE_CASE.xlsm", "223_Amazon_with_prints_SEO.xlsx", "Sheet", "SEO 223", {})}
     report = []
+    renames = load_renames()
     for ser, (tname, f, s1, s2, am) in cfg.items():
-        recs, high, dups = build_series(ser, f, s1, s2, tpl, am)
+        recs, high, dups = build_series(ser, f, s1, s2, tpl, am, renames)
         bad = [(d["A"], c, d[c]) for d, _, _ in recs for c in ("BM", "BN", "BO", "DB", "DC", "DD", "DE", "DF")
                if c in d and d[c] not in tpl["BM" if c[0] == "B" else "DB"]]
         assert not bad, bad[:5]
         write_feed(ser, tname, recs)
         n_asin = sum(1 for _, a, _ in recs if a)
         report.append(f"{ser}: rows={len(recs)} edit(ASIN)={n_asin} create={len(recs)-n_asin} "
-                      f"skipped_HIGH={len(high)} dup_rows_dropped={dups}")
+                      f"renamed_HIGH_in_feed={sum(1 for _, _, rn in recs if rn)} skipped_HIGH={len(high)} dup_rows_dropped={dups}")
         if high:
             with open(os.path.join(ROOT, f"{ser}_excluded_HIGH_policy_risk.csv"), "w", encoding="utf-8-sig") as fh:
                 fh.write("SKU;Title;Policy type\n")
